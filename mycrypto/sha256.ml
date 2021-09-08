@@ -5,7 +5,27 @@
    doing sha256. I just happened to have this laying around already, so... *)
 
 module type Int32_intf = sig
-  type t
+  type elt
+
+  (* The compiler has trouble looking through the module interface and figuring
+     out that it should emit fast integer arrays instead of generic arrays.
+     Specifying the array element types via this definition will help.
+
+     It's worth about a 30% speedup.
+
+     More discussion here:
+     https://discuss.ocaml.org/t/unboxed-int32-t-on-64-bit/8363/18
+  *)
+  module Array : sig
+    type t = elt array
+
+    val make : int -> elt -> t
+    val get : t -> int -> elt
+    val unsafe_get : t -> int -> elt
+    val unsafe_set : t -> int -> elt -> unit
+  end
+
+  type t = elt
 
   val logand : t -> t -> t
   val take_lower_32_bits : t -> t
@@ -20,18 +40,27 @@ module type Int32_intf = sig
   val of_char : char -> t
 end
 
-(* Putting this in a nice module interface prevents inlining, which costs about
-   a 45% speed hit! *)
-module Unboxed_int32 : Int32_intf = struct
+module Unboxed_int32 = struct
   (* Provides unboxed 32-bit operations on 64-bit platforms.
      Must do [take_lower_32_bits x] before final storing or bitwise shifts to
      avoid pulling stuff in from the higher 32-bits.
 
      Fast bitwise modulus of powers of 2: n % m == n & (m - 1)
   *)
-  type t = int
+  type elt = int
 
-  let raise_2_to_32 = Int.of_float (2. ** 32.)
+  module Array = struct
+    type t = elt array
+
+    let make size elt : t = Array.make size (elt : elt)
+    let get a i = Array.get (a : t) i
+    let unsafe_get a i : elt = Array.unsafe_get (a : t) i
+    let unsafe_set a i elt = Array.unsafe_set (a : t) i (elt : elt)
+  end
+
+  type t = elt
+
+  let raise_2_to_32 = 1 lsl 32
   let raise_2_to_32_minus_1 = pred raise_2_to_32
   let logand a b = Int.logand a b
   let take_lower_32_bits x = logand x raise_2_to_32_minus_1
@@ -46,23 +75,37 @@ module Unboxed_int32 : Int32_intf = struct
   let of_char c = Char.code c
 end
 
-module Boxed_int32 : Int32_intf = struct
+module Boxed_int32 = struct
   include Int32
+
+  type elt = t
+
+  module Array = struct
+    type t = elt array
+
+    let make size elt : t = Array.make size (elt : elt)
+    let get a i = Array.get (a : t) i
+    let unsafe_get a i : elt = Array.unsafe_get (a : t) i
+    let unsafe_set a i elt = Array.unsafe_set (a : t) i (elt : elt)
+  end
+
+  type t = elt
 
   let take_lower_32_bits x = x
   let to_stdlib_int32 x = x
   let of_char c = of_int (Char.code c)
 end
 
-(* doing this at runtime through first class modules slows by about 45%, see inlining thing above *)
-let unboxed_int32_module = (module Unboxed_int32 : Int32_intf)
-let boxed_int32_module = (module Boxed_int32 : Int32_intf)
+let boxed_int32 = (module Boxed_int32 : Int32_intf)
+let unboxed_int32 = (module Unboxed_int32 : Int32_intf)
 
 module Int32 =
-  (val match Sys.word_size with
-     | 32 -> boxed_int32_module
-     | 64 -> unboxed_int32_module
+(val match Sys.word_size with
+     | 32 -> boxed_int32
+     | 64 -> unboxed_int32
      | bits -> failwith (Printf.sprintf "Sys.word_size: unsupported: %d" bits))
+
+module Array = Int32.Array
 
 let shift_right x n = Int32.shift_right_logical x n
 let rotate2 x = Int32.logor (shift_right x 2) (Int32.shift_left x 30)
@@ -84,9 +127,9 @@ let maj x y z = Int32.logxor (Int32.logand x y) (Int32.logxor (Int32.logand x z)
 
 type t =
   { mutable total_length : Int64.t;
-    mutable h : Int32.t array;
+    mutable h : Int32.Array.t;
     buffer : Buffer.t;
-    w : Int32.t Array.t;
+    w : Int32.Array.t;
     mutable is_final : bool
   }
 
@@ -165,7 +208,7 @@ let k =
      0xbef9a3f7;
      0xc67178f2
   |]
-  |> Array.map Int32.of_int
+  |> Stdlib.Array.map Int32.of_int
 
 let create () =
   { total_length = 0L;
@@ -193,7 +236,7 @@ let update ctx message =
   (* Process a 64-byte message into 16 32-bit integers. *)
   for t = 0 to 15 do
     (* There's a Bytes.get_int32_be that can do this, but it fails one of the unit tests for some
-       reason, and it isn't faster anyway *)
+          reason, and it isn't faster anyway *)
     let x =
       let a = Int32.of_char (String.unsafe_get message (t * 4)) in
       let b = Int32.of_char (String.unsafe_get message ((t * 4) + 1)) in
