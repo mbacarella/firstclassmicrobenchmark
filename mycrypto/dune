@@ -1,0 +1,6 @@
+(library
+ (name mycrypto)
+ (inline_tests)
+ (libraries core_kernel)
+ (preprocess
+  (pps ppx_inline_test)))

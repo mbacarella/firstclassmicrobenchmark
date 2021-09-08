@@ -1,0 +1,4 @@
+(executables
+ (names test_sha256)
+ (libraries core_kernel mycrypto)
+ (promote (until-clean)))
